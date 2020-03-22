@@ -1,0 +1,358 @@
+#!/usr/bin/perl
+# Sasank Madineni (smadinen@ucsc.edu), Henry Nguyen (hnguye87@ucsc.edu)
+use strict;
+use warnings;
+use Getopt::Std;
+
+#hash containing all macros
+my %macro_hash;
+#hash containing targets
+#format: target_hash{key} = {command=>"str", prereqs=>[]};
+my %target_hash;
+#hash containing templates of targets
+my %template_hash;
+#1 if debug flag set
+my $is_debug = 0;
+#the last target added to the target hash
+my $last_target = "";
+#the target of the makefile
+my $target = "";
+#the number of arguments being passed
+my $ARGC = (scalar @ARGV);
+#hash of all arguments being passed
+my %opts;
+#array of all targets made
+my @targets_made;
+
+=begin comment
+Function: parse_file
+Description: parses makefile
+Parameters: filename - the file that is being parsed
+=cut
+sub parse_file {
+   my $filename = "Makefile";
+   my $count = 1;
+   open(DATA, $filename) || die "Error: Makefile not found.";
+
+   while(<DATA>) {
+      print "Line $count: $_" if $is_debug;
+      $count = $count + 1;
+      if ($_ =~ /#.*/) {
+         #comment so ignore
+         print "Ignoring Comment Line\n" if $is_debug;
+      }
+      elsif ($_ =~ /(^\w+[ \t]*=[ \t]*.+$)/) {
+         #macro = value
+         my @split_data = split(/ =/, $_, 2);
+         my $key = $split_data[0];
+         my $value = $split_data[1];
+         $key = trim($key);
+         $value = trim($value);
+         print "Adding Macro w/ Key $key and Value $value\n"
+            if $is_debug;
+         $macro_hash{$key} = $value;
+      }
+      elsif ($_ =~ /(^.+[ \t]*:[ \t]*.+$)/) {
+         #target: prereq(s)
+         print "Prereq Line:\n" if $is_debug;
+         my @prereqs = split(':', $_);
+         $last_target = trim($prereqs[0]);
+         if(defined $target) {}
+         else {
+            $target = $last_target;
+            print "setting undef target to \'$target\'\n" if $is_debug;
+         }
+         @prereqs = split(' ', $prereqs[1]);
+
+         print "target: $last_target\nprereqs: " if $is_debug;
+         foreach my $prereq (@prereqs) {
+            print "$prereq, " if $is_debug;
+         }
+         print "\n" if $is_debug;
+
+         #adding target to target_hash along with prereqs
+         @{$target_hash{$last_target}->{prereqs}} = @prereqs;
+      }
+      elsif ($_ =~ /(^\t.+$)/) {
+         #command
+         my $system_str = (split /\t/, $_)[1];
+         print "system string: $system_str" if $is_debug;
+
+         #adding command to the last target passed
+         $target_hash{$last_target}->{command} = $system_str;
+      }
+      else {
+         print "Blank Line\n" if $is_debug;
+      }
+      print "\n" if $is_debug;
+   }
+
+   print_target_hash() if $is_debug;
+   print_macro_hash() if $is_debug;
+}
+
+=begin comment
+Function: replace_with_macros
+Description: reaplaces all values between {} with values found in
+             macro table
+=cut
+sub replace_with_macros {
+   #replace macro targets with macros
+   print "Replacing Macros:\n" if $is_debug;
+   foreach my $key (keys %macro_hash) {
+      my @macro_defs = split ' ', $macro_hash{$key};
+      foreach my $def (@macro_defs) {
+         if (index($def, '${') != -1) {
+            my $macro_key = substr $def, 2, -1;
+            print "replacing $def with $macro_hash{$macro_key}\n"
+               if $is_debug;
+            $def = $macro_hash{$macro_key};
+         }
+         $macro_hash{$key} = join(' ', @macro_defs);
+      }
+   }
+
+   print "\nReplacing Prereqs:\n" if $is_debug;
+   #replace prereqs with macros
+   foreach my $key (keys %target_hash) {
+      my @values = @{$target_hash{$key}->{prereqs}};
+      my @new_values;
+      foreach my $value (@values) {
+         if($value =~ /^\$\{(.+)\}/) {
+            my $macro_key = substr $value, 2, -1;
+            print "replacing $value with $macro_hash{$macro_key}\n"
+               if $is_debug;
+            $value = $macro_hash{$macro_key};
+            push @new_values, (split ' ', $value);
+         }
+         else {
+            push @new_values, $value;
+         }
+
+      }
+      @{$target_hash{$key}->{prereqs}} = @new_values;
+   }
+
+   #replace commands with macros
+   print "\nReplacing Commands:\n" if $is_debug;
+   foreach my $key (keys %target_hash) {
+      if (defined $target_hash{$key}->{command}) {
+         my @arr = split(" ", $target_hash{$key}->{command});
+         my $str = "";
+         foreach my $ele (@arr){
+            if($ele =~ /\$\{(.+)\}/){
+               my $index_delim = index $ele, '$';
+               my $pre_ele = substr $ele, 0, $index_delim;
+               print "replacing $ele with $pre_ele$macro_hash{$1}\n"
+                  if $is_debug;
+               $str = $str . $pre_ele . $macro_hash{$1} . " ";
+            }
+            else{
+               $str = $str . $ele . " ";
+            }
+         }
+         $target_hash{$key}->{command} = $str;
+      }
+   }
+
+   #replacing targets with macros
+   print "\nReplacing Targets:\n" if $is_debug;
+   foreach my $key (keys %target_hash) {
+      if ( $key =~ /^\$\{(.+)\}/ ) {
+         my $trim_key = substr $key, 2, -1;
+         print "Replaced Target $key with $macro_hash{$trim_key}\n"
+            if $is_debug;
+         my $new_key = $macro_hash{$trim_key};
+         $target_hash{$new_key} = delete $target_hash{$key};
+      }
+   }
+
+   print_target_hash() if $is_debug;
+   print_macro_hash() if $is_debug;
+}
+
+sub link_targets {
+
+   #generating hash containing templates
+   foreach my $target_key (keys %target_hash) {
+      if ($target_key =~ /%/) {
+         my $trimmed_key =
+            substr($target_key, index($target_key, '%') + 1);
+         $template_hash{$trimmed_key}->{command} =
+            $target_hash{$target_key}->{command};
+         @{$template_hash{$trimmed_key}->{prereqs}} =
+            @{$target_hash{$target_key}->{prereqs}};
+         print "trimmed key: $trimmed_key\n" if $is_debug;
+      }
+   }
+
+   foreach my $target_key (keys %target_hash) {
+      foreach my $trimmed_key (keys %template_hash) {
+         if(defined $target_key and defined $trimmed_key) {
+            print "target key: $target_key is defined\n"
+               if $is_debug;
+            print "trimmed key: $trimmed_key is defined\n"
+               if $is_debug;
+            if ($target_key =~ /$trimmed_key/
+               and not defined $target_hash{$target_key}->{command}) {
+               print "adding command for: $target_key\n"
+                  if $is_debug;
+               $target_hash{$target_key}->{command}
+                  = $template_hash{$trimmed_key}->{command};
+            }
+         }
+      }
+   }
+}
+
+sub make_target {
+   my @arguments = @_;
+   my $curr_target = $arguments[0];
+   my @output_bash = []; #array containing system output
+   my $first_prereq;
+
+   if(defined $curr_target ){ #making sure $curr_target is defined
+      print "current target is defined\n" if $is_debug;
+   }
+   else {
+      print "current target is not defined\n" if $is_debug;
+      return;
+   }
+
+   print "making target: $curr_target\n" if $is_debug;
+
+   my $system_str = $target_hash{$curr_target}->{command};
+
+   my @make_prereqs = @{$target_hash{$curr_target}->{prereqs}};
+
+   if(scalar(@make_prereqs) == 0) {
+      print "make_prerqs is empty\n" if $is_debug;
+   }
+
+   #make prereq targets first
+   foreach my $prereq (@make_prereqs) {
+      if (grep(/$prereq/, (keys %target_hash))) {
+         print "$prereq file doesn't exist\n" if $is_debug;
+         make_target($prereq);
+      }
+   }
+
+   if(defined $system_str) {
+      print "system string is defined\n" if $is_debug;
+   }
+   else {
+      print "system string is not defined\n" if $is_debug;
+      return;
+   }
+
+   if ($system_str =~ /\$</) {
+      $first_prereq = @{$target_hash{$curr_target}->{prereqs}}[0];
+      print "first prereq: $first_prereq\n" if $is_debug;
+      $system_str =~ s/\$</$first_prereq/g;
+      print "\$< displayed as $system_str\n" if $is_debug;
+   }
+
+   if (-e $curr_target) {
+      print "$curr_target already exists. Skipping build\n"
+         if $is_debug;
+      return;
+   }
+   elsif ($system_str =~ /^@.*$/) {
+      #command no stdout
+      print "@ command system str.\n" if $is_debug;
+      $system_str = substr $system_str, 1;
+      @output_bash = system($system_str);
+   }
+   elsif ($system_str =~ /^-.*$/) {
+      #ignore non-zero exit status
+      print "- command system str.\n" if $is_debug;
+      $system_str = substr $system_str, 1;
+      print "$system_str\n";
+      @output_bash = system($system_str);
+      my $term_signal = $? & 0x7F; #absolute value
+      my $core_dumped = $? & 0x80;
+      my $exit_status = ($? >> 8) & 0xFF;
+      # print "$exit_status\n";
+   }
+   else {
+      #print command to stdout
+      print "$system_str\n";
+      @output_bash = system($system_str);
+   }
+   # print "@output_bash\n";
+   print "Finished making target: $curr_target\n" if $is_debug;
+   push @targets_made, $curr_target;
+}
+
+#prints hash tables
+sub print_target_hash {
+
+   # prints target hashtable
+   print "\n";
+   my $target_key = undef;
+   foreach $target_key (keys %target_hash) {
+     	foreach my $ele (@{$target_hash{$target_key}->{prereqs}}) {
+     		print "PREREQUISITE($target_key): $ele\n";
+      }
+      if (defined $target_hash{$target_key}->{command}) {
+         print "COMMAND($target_key): ";
+         print "$target_hash{$target_key}->{command}\n";
+      }
+   }
+}
+
+sub print_macro_hash {
+   #prints macro table
+   print "MACRO: $_ = $macro_hash{$_}\n" for keys %macro_hash;
+}
+
+#trim input string of whitespace
+sub trim {
+   my $s = shift;
+   $s =~ s/^\s+|\s+$//g;
+   return $s;
+}
+
+#--MAIN----------------------------------------------------------------
+
+$opts{'d'} = 0;
+$opts{'target'} = 0;
+getopts("d", \%opts);
+
+if ($ARGC == 0) {
+   $target = undef;
+}
+elsif ($ARGC == 1) { #debug flag is not set
+   if($opts{'d'}!=0) { $target = undef; }
+   else { $target = $ARGV[0]; }
+}
+elsif ($ARGC == 2) { #debug flag is set
+   $target = $ARGV[0];
+}
+else { #error: user inputs incorrect number of args
+   print "usage: ./pmake [-d] [target]\n";
+   exit;
+}
+
+print "Using File: Makefile, Looking for Target: $target\n"
+   if $is_debug;
+
+$is_debug = 1 if $opts{'d'} == 1;
+print "current target: $target\n" if $is_debug && $ARGC > 1;
+parse_file($target);
+
+#Check if target is valid
+if (not(grep(/$target/, keys %target_hash))) {
+   print "pmake: *** No rule for target \'$target\'.  Stop.\n";
+   exit;
+}
+
+replace_with_macros();
+link_targets();
+print_target_hash() if $is_debug;
+make_target($target);
+
+#Check if anything was made
+if(scalar(@targets_made) == 0) {
+   print "pmake: Nothing to be done for \'$target\'\n";
+}

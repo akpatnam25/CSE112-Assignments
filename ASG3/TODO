@@ -1,0 +1,5 @@
+hzip.st:
+- debug (-d) (optional)
+- input compressed to stdout (-t)
+- input compressed to output (-c <file>)
+- input decompressed to output (-u <file>) or stdout (-u)
